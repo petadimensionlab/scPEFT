@@ -46,11 +46,45 @@ from .tokenizer import TOKEN_DICTIONARY_FILE
 from scpeft_mps.device import DEVICE as _DEVICE, empty_cache as _empty_cache  # MPS/CUDA/CPU を自動で選ぶ
 
 
+def _squeeze_keep_batch(x):
+    """バッチ次元を潰さずに余分なサイズ 1 の次元だけ落とす。
+
+    上流は `torch.squeeze` で (1, L, H) を (L, H) に潰すが、その後の
+    `make_comparison_batch` は先頭次元を「細胞の並び」として数えるため、
+    トークン方向の長さを細胞数と誤認してインデックスが範囲外になる
+    （1 細胞だけのミニバッチで必ず起きる）。
+    """
+    return x.squeeze() if x.dim() > 3 else x
+
+
+def _tensor_from(x):
+    """datasets 4.x の Column / list をテンソルにする（すでにテンソルならそのまま）。"""
+    if isinstance(x, torch.Tensor):
+        return x
+    return torch.as_tensor(np.asarray(list(x)))
+
+
 def _to_device_tensor(x):
     """datasets 4.x の Column/list でも動くようにテンソル化してデバイスへ移す。"""
     if hasattr(x, "to"):
         return x.to(_DEVICE)
     return torch.as_tensor(np.asarray(list(x))).to(_DEVICE)
+
+
+def _align_token_len(x1, x2, dim=1):
+    """トークン方向の長さがずれた 2 つのテンソルを、短い方に合わせて切り詰める。
+
+    上流の比較バッチ生成は、遺伝子を 1 つ削った摂動側と、パディングで長さを
+    揃えた比較側とで系列長がトークン 1 個ずれることがある。位置は発現量順の
+    並びなので、はみ出した末尾には対応する位置が無く、切り詰めが妥当。
+    """
+    n = min(x1.size(dim), x2.size(dim))
+    sl = [slice(None)] * x1.dim()
+    sl[dim] = slice(0, n)
+    x1 = x1[tuple(sl)]
+    sl = [slice(None)] * x2.dim()
+    sl[dim] = slice(0, n)
+    return x1, x2[tuple(sl)]
 
 
 logger = logging.getLogger(__name__)
@@ -232,7 +266,7 @@ def make_perturbation_batch(example_cell,
             indices_to_perturb = [[[j for i in indices_to_perturb for j in i], x] for x in all_indices]
     length = len(indices_to_perturb)
     # zmr:增加列：perturb_index 0-length
-    perturbation_dataset = Dataset.from_dict({"input_ids": example_cell["input_ids"] * length,
+    perturbation_dataset = Dataset.from_dict({"input_ids": list(example_cell["input_ids"]) * length,
                                               "perturb_index": indices_to_perturb})
 
     if length < 400:
@@ -400,7 +434,7 @@ def quant_cos_sims(model,
         del perturbation_minibatch
 
         if len(indices_to_perturb) > 1:
-            minibatch_emb = torch.squeeze(outputs.hidden_states[layer_to_quant])
+            minibatch_emb = _squeeze_keep_batch(outputs.hidden_states[layer_to_quant])
         else:
             minibatch_emb = outputs.hidden_states[layer_to_quant]
 
@@ -443,7 +477,7 @@ def quant_cos_sims(model,
             del original_minibatch
 
             if len(indices_to_perturb) > 1:
-                original_minibatch_emb = torch.squeeze(original_outputs.hidden_states[layer_to_quant])
+                original_minibatch_emb = _squeeze_keep_batch(original_outputs.hidden_states[layer_to_quant])
             else:
                 original_minibatch_emb = original_outputs.hidden_states[layer_to_quant]
 
@@ -453,9 +487,9 @@ def quant_cos_sims(model,
                 minibatch_comparison = comparison_batch[i:max_range]
             elif perturb_group == True:
                 minibatch_comparison = make_comparison_batch(original_minibatch_emb,
-                                                             indices_to_perturb,
+                                                             indices_to_perturb[i:max_range],
                                                              perturb_group)
-            cos_sims += [cos(minibatch_emb, minibatch_comparison).to("cpu")]
+            cos_sims += [cos(*_align_token_len(minibatch_emb, minibatch_comparison)).to("cpu")]
         elif cell_states_to_model is not None:
             for state in possible_states:
                 if perturb_group == False:
@@ -1001,7 +1035,7 @@ class InSilicoPerturber:
             for i in trange(len(filtered_input_data)):
                 example_cell = filtered_input_data.select([i])
                 original_emb = forward_pass_single_cell(model, example_cell, layer_to_quant)
-                gene_list = torch.squeeze(example_cell["input_ids"])
+                gene_list = _tensor_from(example_cell["input_ids"]).squeeze()
 
                 # reset to original type to prevent downstream issues due to forward_pass_single_cell modifying as torch format in place
                 example_cell = filtered_input_data.select([i])
@@ -1039,7 +1073,7 @@ class InSilicoPerturber:
                                 if self.tokens_to_perturb != "all":
                                     j_index = torch.tensor(indices_to_perturb[j])
                                     if j_index.shape[0] > 1:
-                                        j_index = torch.squeeze(j_index)
+                                        j_index = _tensor_from(j_index).squeeze()
                                 else:
                                     j_index = torch.tensor([j])
                                 perturbed_gene = torch.index_select(gene_list, 0, j_index)
@@ -1070,7 +1104,7 @@ class InSilicoPerturber:
                                 if (self.tokens_to_perturb != "all") or (combo_lvl > 0):
                                     j_index = torch.tensor(indices_to_perturb[j])
                                     if j_index.shape[0] > 1:
-                                        j_index = torch.squeeze(j_index)
+                                        j_index = _tensor_from(j_index).squeeze()
                                 else:
                                     j_index = torch.tensor([j])
                                 perturbed_gene = torch.index_select(gene_list, 0, j_index)

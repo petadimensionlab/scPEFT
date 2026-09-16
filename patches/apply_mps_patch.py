@@ -49,16 +49,79 @@ RULES: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r'\boriginal_input_data_minibatch\.to\(_DEVICE\)'),
      "_to_device_tensor(original_input_data_minibatch)"),
     (re.compile(r'\binput_data\.to\(_DEVICE\)'), "_to_device_tensor(input_data)"),
+    # 3) 上流の欠陥: 比較バッチと摂動バッチの系列長がトークン 1 個ずれる場合がある
+    #    （削除で短くなった摂動側と、パディングで揃えられた比較側）。コサイン類似の前に
+    #    共通の短い方へ切り詰める。位置は発現量順の並びなので余った末尾に対応物はない。
+    (re.compile(r'cos_sims \+= \[cos\(minibatch_emb, minibatch_comparison\)\.to\("cpu"\)\]'),
+     'cos_sims += [cos(*_align_token_len(minibatch_emb, minibatch_comparison)).to("cpu")]'),
+    # 4) 上流の欠陥: `torch.squeeze` が 1 細胞ミニバッチのバッチ次元を潰し、
+    #    トークン数を細胞数として数えてインデックスが範囲外になる。バッチ次元は残す。
+    #    対象はミニバッチを扱う 2 箇所だけ（forward_pass_single_cell は 1 細胞専用で
+    #    2 次元を期待するため触らない）。
+    (re.compile(r'minibatch_emb = torch\.squeeze\(outputs\.hidden_states\[layer_to_quant\]\)'),
+     'minibatch_emb = _squeeze_keep_batch(outputs.hidden_states[layer_to_quant])'),
+    (re.compile(r'original_minibatch_emb = torch\.squeeze\(original_outputs\.hidden_states\[layer_to_quant\]\)'),
+     'original_minibatch_emb = _squeeze_keep_batch(original_outputs.hidden_states[layer_to_quant])'),
+    # 5) 上流の欠陥: 群摂動の比較バッチに **全細胞分** のインデックスを渡している。
+    #    ループはミニバッチの行を数えるので、別の細胞の位置で切って長さが合わなくなる
+    #    （`Sizes of tensors must match ... Expected size 3851 but got size 3161`）。
+    #    ミニバッチに対応する区間だけを渡す。
+    (re.compile(r'minibatch_comparison = make_comparison_batch\(original_minibatch_emb,\n'
+                r'(\s+)indices_to_perturb,\n'),
+     r'minibatch_comparison = make_comparison_batch(original_minibatch_emb,\n'
+     r'\1indices_to_perturb[i:max_range],\n'),
+    # 6) 同じ datasets 4.x の Column 問題が rank shift 側にもある（torch.squeeze に渡す前に
+    #    テンソル化する）。
+    (re.compile(r'gene_list = torch\.squeeze\(example_cell\["input_ids"\]\)'),
+     'gene_list = _tensor_from(example_cell["input_ids"]).squeeze()'),
+    (re.compile(r'j_index = torch\.squeeze\(j_index\)'), 'j_index = _tensor_from(j_index).squeeze()'),
+    # 7) datasets 4.x の Column は `*` で繰り返せない（rank shift の系列生成）。
+    (re.compile(r'"input_ids": example_cell\["input_ids"\] \* length,'),
+     '"input_ids": list(example_cell["input_ids"]) * length,'),
 ]
 
 # import 行の直後に置くヘルパー（datasets 4.x の Column 対応）
 HELPER = '''
+
+def _squeeze_keep_batch(x):
+    """バッチ次元を潰さずに余分なサイズ 1 の次元だけ落とす。
+
+    上流は `torch.squeeze` で (1, L, H) を (L, H) に潰すが、その後の
+    `make_comparison_batch` は先頭次元を「細胞の並び」として数えるため、
+    トークン方向の長さを細胞数と誤認してインデックスが範囲外になる
+    （1 細胞だけのミニバッチで必ず起きる）。
+    """
+    return x.squeeze() if x.dim() > 3 else x
+
+
+def _tensor_from(x):
+    """datasets 4.x の Column / list をテンソルにする（すでにテンソルならそのまま）。"""
+    if isinstance(x, torch.Tensor):
+        return x
+    return torch.as_tensor(np.asarray(list(x)))
+
 
 def _to_device_tensor(x):
     """datasets 4.x の Column/list でも動くようにテンソル化してデバイスへ移す。"""
     if hasattr(x, "to"):
         return x.to(_DEVICE)
     return torch.as_tensor(np.asarray(list(x))).to(_DEVICE)
+
+
+def _align_token_len(x1, x2, dim=1):
+    """トークン方向の長さがずれた 2 つのテンソルを、短い方に合わせて切り詰める。
+
+    上流の比較バッチ生成は、遺伝子を 1 つ削った摂動側と、パディングで長さを
+    揃えた比較側とで系列長がトークン 1 個ずれることがある。位置は発現量順の
+    並びなので、はみ出した末尾には対応する位置が無く、切り詰めが妥当。
+    """
+    n = min(x1.size(dim), x2.size(dim))
+    sl = [slice(None)] * x1.dim()
+    sl[dim] = slice(0, n)
+    x1 = x1[tuple(sl)]
+    sl = [slice(None)] * x2.dim()
+    sl[dim] = slice(0, n)
+    return x1, x2[tuple(sl)]
 '''
 
 

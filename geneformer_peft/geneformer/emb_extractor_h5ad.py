@@ -45,11 +45,45 @@ from geneformer.tokenizer import TOKEN_DICTIONARY_FILE
 from scpeft_mps.device import DEVICE as _DEVICE, empty_cache as _empty_cache  # MPS/CUDA/CPU を自動で選ぶ
 
 
+def _squeeze_keep_batch(x):
+    """バッチ次元を潰さずに余分なサイズ 1 の次元だけ落とす。
+
+    上流は `torch.squeeze` で (1, L, H) を (L, H) に潰すが、その後の
+    `make_comparison_batch` は先頭次元を「細胞の並び」として数えるため、
+    トークン方向の長さを細胞数と誤認してインデックスが範囲外になる
+    （1 細胞だけのミニバッチで必ず起きる）。
+    """
+    return x.squeeze() if x.dim() > 3 else x
+
+
+def _tensor_from(x):
+    """datasets 4.x の Column / list をテンソルにする（すでにテンソルならそのまま）。"""
+    if isinstance(x, torch.Tensor):
+        return x
+    return torch.as_tensor(np.asarray(list(x)))
+
+
 def _to_device_tensor(x):
     """datasets 4.x の Column/list でも動くようにテンソル化してデバイスへ移す。"""
     if hasattr(x, "to"):
         return x.to(_DEVICE)
     return torch.as_tensor(np.asarray(list(x))).to(_DEVICE)
+
+
+def _align_token_len(x1, x2, dim=1):
+    """トークン方向の長さがずれた 2 つのテンソルを、短い方に合わせて切り詰める。
+
+    上流の比較バッチ生成は、遺伝子を 1 つ削った摂動側と、パディングで長さを
+    揃えた比較側とで系列長がトークン 1 個ずれることがある。位置は発現量順の
+    並びなので、はみ出した末尾には対応する位置が無く、切り詰めが妥当。
+    """
+    n = min(x1.size(dim), x2.size(dim))
+    sl = [slice(None)] * x1.dim()
+    sl[dim] = slice(0, n)
+    x1 = x1[tuple(sl)]
+    sl = [slice(None)] * x2.dim()
+    sl[dim] = slice(0, n)
+    return x1, x2[tuple(sl)]
 
 
 from geneformer.in_silico_perturber import load_and_filter, load_and_filter_no_shuffled, \

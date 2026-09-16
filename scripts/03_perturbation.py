@@ -63,10 +63,16 @@ def main() -> int:
     from geneformer_peft.geneformer.in_silico_perturber import InSilicoPerturber
     from geneformer_peft.geneformer.in_silico_perturber_stats import InSilicoPerturberStats
 
-    # 辞書のキーは Ensembl ID。記号のまま渡すと実行が止まるため変換する。
-    genes = symbols_to_ensembl(args.genes.split(","))
-    if not genes:
-        raise SystemExit("指定した遺伝子が辞書に見つかりません（Ensembl ID かを確認してください）")
+    raw = args.genes.strip()
+    if raw.lower() == "all":
+        # 全遺伝子の rank shift（genes_to_perturb="all"）。群モードを使わない経路。
+        genes = ["all"]
+        log("  モード: 全遺伝子の rank shift（genes_to_perturb='all'）")
+    else:
+        # 辞書のキーは Ensembl ID。記号のまま渡すと実行が止まるため変換する。
+        genes = symbols_to_ensembl(raw.split(","))
+        if not genes:
+            raise SystemExit("指定した遺伝子が辞書に見つかりません（Ensembl ID かを確認してください）")
     log(f"  削除対象（Ensembl）: {', '.join(genes)}")
 
     states = None
@@ -82,20 +88,23 @@ def main() -> int:
     from _common import TOKEN_DICT as _TD
 
     allowed = _pk.load(open(_TD, "rb"))
-    toks = _ds.load_from_disk(str(ds))
-    sub = toks.filter(lambda ex: ex.get("celltype") == args.celltype) if args.celltype else toks
-    usable = []
-    for gene in genes:
-        tid = allowed.get(gene)
-        n_hit = sum(1 for row in sub["input_ids"] if tid in row)
-        log(f"  検出確認: {gene} → {n_hit} / {len(sub)} 細胞（{n_hit / max(len(sub), 1):.1%}）")
-        if n_hit == 0:
-            log(f"  !! {gene} は対象細胞に存在しないため除外します（削除しても何も起きない）")
-            continue
-        usable.append(gene)
-    if not usable:
-        raise SystemExit("削除できる遺伝子がありません（発現する遺伝子を指定してください）")
-    genes = usable
+    if genes == ["all"]:
+        log("  検出確認: 全遺伝子の rank shift のためスキップ")
+    else:
+        toks = _ds.load_from_disk(str(ds))
+        sub = toks.filter(lambda ex: ex.get("celltype") == args.celltype) if args.celltype else toks
+        usable = []
+        for gene in genes:
+            tid = allowed.get(gene)
+            n_hit = sum(1 for row in sub["input_ids"] if tid in row)
+            log(f"  検出確認: {gene} → {n_hit} / {len(sub)} 細胞（{n_hit / max(len(sub), 1):.1%}）")
+            if n_hit == 0:
+                log(f"  !! {gene} は対象細胞に存在しないため除外します（削除しても何も起きない）")
+                continue
+            usable.append(gene)
+        if not usable:
+            raise SystemExit("削除できる遺伝子がありません（発現する遺伝子を指定してください）")
+        genes = usable
 
     made = []
     for gene in genes:
@@ -103,7 +112,7 @@ def main() -> int:
         log(f"  摂動: {tag}")
         isp = InSilicoPerturber(
             perturb_type="delete",
-            genes_to_perturb=[gene],
+            genes_to_perturb=("all" if gene == "all" else [gene]),
             combos=0,
             anchor_gene=None,
             model_type=args.model_type,
