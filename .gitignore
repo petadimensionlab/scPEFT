@@ -1,0 +1,17 @@
+# --- scPEFT の MPS 対応で追加 ---
+# 展開した vendored transformers（zip は追跡済み。展開物は追跡しない）
+geneformer_peft/transformerslocal/*
+!geneformer_peft/transformerslocal/transformerslocal.zip
+# 直下に置く import 解決用のシンボリックリンク
+/transformerslocal
+# パッチのバックアップ
+*.orig
+# 実行の成果物
+outputs/
+logs/
+# Python のキャッシュ
+__pycache__/
+*.pyc
+
+# 一時ログ
+logs_*.log

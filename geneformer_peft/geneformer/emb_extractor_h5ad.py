@@ -3,6 +3,7 @@ Geneformer embedding extractor.
 
 Usage:
   from geneformer import EmbExtractor
+from scpeft_mps.device import DEVICE as _DEVICE, empty_cache as _empty_cache  # MPS/CUDA/CPU を自動で選ぶ
   embex = EmbExtractor(model_type="CellClassifier",
                        num_classes=3,
                        emb_mode="cell",
@@ -57,7 +58,7 @@ logger = logging.getLogger(__name__)
 # get cell embeddings excluding padding
 def mean_nonpadding_embs(embs, original_lens):
     # mask based on padding lengths
-    mask = torch.arange(embs.size(1)).unsqueeze(0).to("cuda") < original_lens.unsqueeze(1)
+    mask = torch.arange(embs.size(1)).unsqueeze(0).to(_DEVICE) < original_lens.unsqueeze(1)
 
     # extend mask dimensions to match the embeddings tensor
     mask = mask.unsqueeze(2).expand_as(embs)
@@ -89,7 +90,7 @@ def get_embs(model,
 
         minibatch = filtered_input_data.select([i for i in range(i, max_range)])
         max_len = max(minibatch["length"])
-        original_lens = torch.tensor(minibatch["length"]).to("cuda")
+        original_lens = torch.tensor(minibatch["length"]).to(_DEVICE)
         minibatch.set_format(type="torch")
 
         input_data_minibatch = minibatch["input_ids"]
@@ -101,8 +102,8 @@ def get_embs(model,
         attention_mask[input_data_minibatch == 0] = 0
         with torch.no_grad():
             outputs = model(
-                input_ids=input_data_minibatch.to("cuda"),
-                attention_mask=attention_mask.to("cuda")
+                input_ids=input_data_minibatch.to(_DEVICE),
+                attention_mask=attention_mask.to(_DEVICE)
             )
 
         embs_i = outputs.hidden_states[layer_to_quant]
@@ -116,7 +117,7 @@ def get_embs(model,
         del input_data_minibatch
         del embs_i
         del mean_embs
-        torch.cuda.empty_cache()
+        _empty_cache()
 
     embs_stack = torch.cat(embs_list)
     return embs_stack
@@ -138,7 +139,7 @@ def get_embs(model,
 #
 #         minibatch = filtered_input_data.select([i for i in range(i, max_range)])
 #         max_len = max(minibatch["length"])
-#         original_lens = torch.tensor(minibatch["length"]).to("cuda")
+#         original_lens = torch.tensor(minibatch["length"]).to(_DEVICE)
 #         minibatch.set_format(type="torch")
 #
 #         input_data_minibatch = minibatch["input_ids"]
@@ -149,7 +150,7 @@ def get_embs(model,
 #
 #         with torch.no_grad():
 #             outputs = model(
-#                 input_ids=input_data_minibatch.to("cuda"),
+#                 input_ids=input_data_minibatch.to(_DEVICE),
 #             )
 #
 #         embs_i = outputs.hidden_states[layer_to_quant]
@@ -163,7 +164,7 @@ def get_embs(model,
 #         del input_data_minibatch
 #         del embs_i
 #         del mean_embs
-#         torch.cuda.empty_cache()
+#         _empty_cache()
 #
 #     embs_stack = torch.cat(embs_list)
 #     return embs_stack
