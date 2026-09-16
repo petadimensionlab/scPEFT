@@ -3,7 +3,6 @@ Geneformer in silico perturber.
 
 Usage:
   from geneformer import InSilicoPerturber
-from scpeft_mps.device import DEVICE as _DEVICE, empty_cache as _empty_cache  # MPS/CUDA/CPU を自動で選ぶ
   isp = InSilicoPerturber(perturb_type="delete",
                           perturb_rank_shift=None,
                           genes_to_perturb="all",
@@ -40,10 +39,19 @@ sns.set()
 import torch
 from collections import defaultdict
 from datasets import Dataset, load_from_disk
-from tqdm.notebook import trange
+from tqdm.auto import trange
 from transformers import BertForMaskedLM, BertForTokenClassification
 from transformerslocal.src.transformers.models.bert.modeling_bert import BertForSequenceClassification
 from .tokenizer import TOKEN_DICTIONARY_FILE
+from scpeft_mps.device import DEVICE as _DEVICE, empty_cache as _empty_cache  # MPS/CUDA/CPU を自動で選ぶ
+
+
+def _to_device_tensor(x):
+    """datasets 4.x の Column/list でも動くようにテンソル化してデバイスへ移す。"""
+    if hasattr(x, "to"):
+        return x.to(_DEVICE)
+    return torch.as_tensor(np.asarray(list(x))).to(_DEVICE)
+
 
 logger = logging.getLogger(__name__)
 
@@ -148,7 +156,7 @@ def forward_pass_single_cell(model, example_cell, layer_to_quant):
     input_data = example_cell["input_ids"]
     with torch.no_grad():
         outputs = model(
-            input_ids=input_data.to(_DEVICE)
+            input_ids=_to_device_tensor(input_data)
         )
     emb = torch.squeeze(outputs.hidden_states[layer_to_quant])
     del outputs
@@ -309,7 +317,7 @@ def get_cell_state_avg_embs(model,
 
             with torch.no_grad():
                 outputs = model(
-                    input_ids=input_data_minibatch.to(_DEVICE)
+                    input_ids=_to_device_tensor(input_data_minibatch)
                 )
 
             state_embs_i = outputs.hidden_states[layer_to_quant]
@@ -386,7 +394,7 @@ def quant_cos_sims(model,
         # extract embeddings for perturbation minibatch
         with torch.no_grad():
             outputs = model(
-                input_ids=input_data_minibatch.to(_DEVICE)
+                input_ids=_to_device_tensor(input_data_minibatch)
             )
         del input_data_minibatch
         del perturbation_minibatch
@@ -429,7 +437,7 @@ def quant_cos_sims(model,
             # extract embeddings for original minibatch
             with torch.no_grad():
                 original_outputs = model(
-                    input_ids=original_input_data_minibatch.to(_DEVICE)
+                    input_ids=_to_device_tensor(original_input_data_minibatch)
                 )
             del original_input_data_minibatch
             del original_minibatch

@@ -20,7 +20,8 @@ import argparse
 import sys
 from pathlib import Path
 
-from _common import DEFAULT_BATCH, DEVICE, MODEL_DIR, banner, log, out_dir, save_json, tokenize_h5ad, tracked
+from _common import (DEFAULT_BATCH, DEVICE, MODEL_DIR, TOKEN_DICT, banner, log, out_dir, save_json,
+                     symbols_to_ensembl, tokenize_h5ad, tracked)
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
@@ -62,43 +63,80 @@ def main() -> int:
     from geneformer_peft.geneformer.in_silico_perturber import InSilicoPerturber
     from geneformer_peft.geneformer.in_silico_perturber_stats import InSilicoPerturberStats
 
+    # 辞書のキーは Ensembl ID。記号のまま渡すと実行が止まるため変換する。
+    genes = symbols_to_ensembl(args.genes.split(","))
+    if not genes:
+        raise SystemExit("指定した遺伝子が辞書に見つかりません（Ensembl ID かを確認してください）")
+    log(f"  削除対象（Ensembl）: {', '.join(genes)}")
+
     states = None
     if args.start and args.goal:
         states = {args.state_key: ([args.start], [args.goal], [])}
-    isp = InSilicoPerturber(
-        perturb_type="delete",
-        genes_to_perturb=args.genes.split(","),
-        combos=0,
-        anchor_gene=None,
-        model_type=args.model_type,
-        num_classes=args.num_classes,
-        emb_mode="cell",
-        cell_emb_style="mean_pool",
-        filter_data={"celltype": [args.celltype]} if args.celltype else None,
-        cell_states_to_model=states,
-        max_ncells=args.max_ncells,
-        emb_layer=-1,
-        forward_batch_size=args.batch,
-        nproc=1,
-    )
-    log(f"  削除対象: {args.genes}  max_ncells={args.max_ncells}  batch={args.batch}")
-    isp.perturb_data(model_directory=str(MODEL_DIR.parent),
-                     input_data_file=str(ds),
-                     output_directory=str(out),
-                     output_prefix="perturb")
 
-    stats = InSilicoPerturberStats(mode="goal_state_shift",
-                                   genes_perturbed=args.genes.split(","),
-                                   combos=0,
-                                   anchor_gene=None,
-                                   cell_states_to_model=states)
-    stats.get_stats(input_data_directory=str(out),
-                    null_dist_data_directory=None,
-                    output_directory=str(out / "stats"),
-                    output_prefix="shift")
+    # 複数遺伝子をまとめて渡すと「全遺伝子を共発現する細胞」が必要になり、空集合で止まる。
+    # リポジトリのチュートリアルと同じく **1 遺伝子ずつ**実行する。
+    # 遺伝子が細胞に 1 つも無いと ISP は「共発現する細胞が無い」で止まる。
+    # 実行前にトークン保有細胞を数え、0 の遺伝子は理由を添えて除外する。
+    import datasets as _ds
+    import pickle as _pk
+    from _common import TOKEN_DICT as _TD
 
-    logs = sorted((out / "stats").glob("*"))
+    allowed = _pk.load(open(_TD, "rb"))
+    toks = _ds.load_from_disk(str(ds))
+    sub = toks.filter(lambda ex: ex.get("celltype") == args.celltype) if args.celltype else toks
+    usable = []
+    for gene in genes:
+        tid = allowed.get(gene)
+        n_hit = sum(1 for row in sub["input_ids"] if tid in row)
+        log(f"  検出確認: {gene} → {n_hit} / {len(sub)} 細胞（{n_hit / max(len(sub), 1):.1%}）")
+        if n_hit == 0:
+            log(f"  !! {gene} は対象細胞に存在しないため除外します（削除しても何も起きない）")
+            continue
+        usable.append(gene)
+    if not usable:
+        raise SystemExit("削除できる遺伝子がありません（発現する遺伝子を指定してください）")
+    genes = usable
+
+    made = []
+    for gene in genes:
+        tag = gene
+        log(f"  摂動: {tag}")
+        isp = InSilicoPerturber(
+            perturb_type="delete",
+            genes_to_perturb=[gene],
+            combos=0,
+            anchor_gene=None,
+            model_type=args.model_type,
+            num_classes=args.num_classes,
+            emb_mode="cell",
+            cell_emb_style="mean_pool",
+            filter_data={"celltype": [args.celltype]} if args.celltype else None,
+            cell_states_to_model=states,
+            max_ncells=args.max_ncells,
+            emb_layer=-1,
+            forward_batch_size=args.batch,
+            nproc=1,
+            token_dictionary_file=TOKEN_DICT,   # 既定は別の辞書。gc104M を明示しないとトークンが一致しない
+        )
+        isp.perturb_data(model_directory=str(MODEL_DIR),
+                         input_data_file=str(ds),
+                         output_directory=str(out / tag),
+                         output_prefix=tag)
+        made.append(str(out / tag))
+
+        stats = InSilicoPerturberStats(mode="goal_state_shift",
+                                       genes_perturbed=[gene],
+                                       combos=0,
+                                       anchor_gene=None,
+                                       cell_states_to_model=states)
+        stats.get_stats(input_data_directory=str(out / tag),
+                        null_dist_data_directory=None,
+                        output_directory=str(out / tag / "stats"),
+                        output_prefix="shift")
+
+    logs = sorted((out).glob("*"))
     save_json({"device": str(DEVICE), "genes": args.genes.split(","),
+               "ensemble_ids": genes,
                "celltype": args.celltype, "state_key": args.state_key,
                "start": args.start, "goal": args.goal,
                "max_ncells": args.max_ncells, "batch": args.batch,

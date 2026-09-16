@@ -46,7 +46,7 @@ from scpeft_mps.device import DEVICE, NAME, describe, empty_cache  # noqa: E402
 GF_DIR = Path(os.environ.get("GENEFORMER_DIR",
                              str(Path.home() / "workspace/research/Geneformer/geneformer_hf")))
 MODEL_NAME = os.environ.get("GENEFORMER_MODEL", "Geneformer-V2-316M")
-MODEL_DIR = GF_DIR / "geneformer" / MODEL_NAME
+MODEL_DIR = GF_DIR / MODEL_NAME          # 重みは geneformer_hf/ の直下（geneformer/ の下ではない）
 TOKEN_DICT = GF_DIR / "geneformer" / "token_dictionary_gc104M.pkl"
 NAME_ID_DICT = GF_DIR / "geneformer" / "gene_name_id_dict_gc104M.pkl"
 
@@ -176,9 +176,13 @@ def tracked(fn):
         with memory_guard() as mem:
             code = fn(*args, **kwargs)
         rec = mem.summary()
-        rec["script"] = fn.__module__
+        # スクリプト名ごとに残す（`__module__` は全スクリプトで "__main__" になり上書きされるため）
+        import os as _os
+        name = Path(getattr(sys, "argv", ["task"])[0]).stem or "task"
+        rec["script"] = name
+        rec["argv"] = " ".join(getattr(sys, "argv", [])[1:])[:300]
         rec["elapsed_sec"] = round(time.time() - t0, 1)
-        dest = REPO / "outputs" / f"{fn.__module__}_memory.json"
+        dest = REPO / "outputs" / f"{name}_memory.json"
         try:
             save_json(rec, dest)
         except Exception:  # noqa: BLE001
@@ -274,14 +278,28 @@ def extract_embeddings(dataset: Path, out: Path, prefix: str,
     )
     log(f"  EmbExtractor: model_type={model_type} emb_mode={emb_mode} batch={batch} "
         f"max_ncells={max_ncells}")
-    made = ex.extract_embs(model_directory=str(MODEL_DIR.parent),
-                           input_data_file=str(dataset),
-                           output_directory=str(out),
-                           output_prefix=prefix)
+    res = ex.extract_embs(model_directory=str(MODEL_DIR),   # scPEFT は「モデル本体のフォルダ」を期待する
+                          input_data_file=str(dataset),
+                          output_directory=str(out),
+                          output_prefix=prefix)
     empty_cache()
-    if made is None:
-        return sorted(out.glob(f"{prefix}*"))
-    return [Path(p) for p in (made if isinstance(made, (list, tuple)) else [made])]
+    # scPEFT の extract_embs は DataFrame を返す（CSV も書く）。型に依存しないように扱う。
+    try:
+        import pandas as pd
+
+        if isinstance(res, pd.DataFrame):
+            csv = out / f"{prefix}_embs.csv"
+            res.to_csv(csv, index=False)
+            log(f"    埋め込み: {res.shape} → {csv.name}")
+            return [csv]
+    except Exception:  # noqa: BLE001
+        pass
+    if res is None:
+        found = sorted(out.glob(f"{prefix}*.csv")) or sorted(out.glob("*.csv"))
+        if not found:
+            raise SystemExit(f"埋め込みの出力が見つかりません: {out}")
+        return found
+    return [Path(p) for p in (res if isinstance(res, (list, tuple)) else [res])]
 
 
 def load_embeddings(path: Path):
@@ -296,7 +314,37 @@ def load_embeddings(path: Path):
     return np.asarray(arr, dtype=np.float32), None
 
 
-# --- 3. 評価の小道具 ---------------------------------------------------------
+# --- 3. 遺伝子記号の解決 -------------------------------------------------------
+def symbols_to_ensembl(genes: list[str], warn: bool = True) -> list[str]:
+    """遺伝子記号を Ensembl ID に変換する。
+
+    scPEFT の辞書（`token_dictionary_gc104M.pkl`）のキーは **Ensembl ID** なので、
+    記号のまま渡すと「辞書に無い」と判定されて実行が止まる。
+    すでに Ensembl 形式のものはそのまま通す。
+    """
+    name_id = pickle.load(open(NAME_ID_DICT, "rb"))
+    out, missing = [], []
+    for g in genes:
+        g = g.strip()
+        if not g:
+            continue
+        if g.startswith("ENSG"):
+            out.append(g)
+        elif g in name_id:
+            out.append(name_id[g])
+        else:
+            missing.append(g)
+    if missing and warn:
+        log(f"  !! 辞書に無い記号です（除外）: {', '.join(missing)}")
+    return out
+
+
+def ensembl_to_symbols(ids: list[str]) -> dict[str, str]:
+    name_id = pickle.load(open(NAME_ID_DICT, "rb"))
+    return {v: k for k, v in name_id.items()}
+
+
+# --- 4. 評価の小道具 ---------------------------------------------------------
 def classification_metrics(y_true, y_pred) -> dict:
     from sklearn.metrics import (accuracy_score, classification_report,
                                  confusion_matrix, f1_score)

@@ -20,8 +20,8 @@ from pathlib import Path
 
 import numpy as np
 
-from _common import (DEFAULT_BATCH, DEVICE, banner, extract_embeddings, log, out_dir,
-                     save_json, tokenize_h5ad, tracked)
+from _common import (DEFAULT_BATCH, DEVICE, banner, ensembl_to_symbols, extract_embeddings,
+                     log, out_dir, save_json, symbols_to_ensembl, tokenize_h5ad, tracked)
 
 
 def parse() -> argparse.Namespace:
@@ -61,45 +61,53 @@ def expression_markers(h5ad: Path, key: str, top_n: int, out: Path) -> dict:
 
 def context_markers(dataset: Path, queries: list[str], top_n: int, out: Path,
                     batch: int) -> dict:
-    """B. Geneformer の遺伝子埋め込みのコサイン類似によるマーカー。"""
-    from _common import GF_DIR
+    """B. Geneformer の**入力埋め込み行列**を使った遺伝子の類似（発現量に依存しない見方）。
+
+    scPEFT の EmbExtractor は `emb_mode="gene"` を「開発中」として拒否するため、
+    モデルの `word_embeddings`（語彙 × 隠れ次元）を直接使う。
+    コサイン類似が高い = 同じ文脈で使われる遺伝子。
+    """
     import pickle
     import torch
-    from geneformer_peft.geneformer.emb_extractor import EmbExtractor
+    from geneformer_peft.geneformer.in_silico_perturber import load_model
     from scpeft_mps.device import DEVICE, empty_cache
 
-    emb_dir = out / "gene_emb"
-    emb_dir.mkdir(parents=True, exist_ok=True)
-    ex = EmbExtractor(model_type="Pretrained", emb_mode="gene", cell_emb_style="mean_pool",
-                      max_ncells=200, emb_layer=-1, forward_batch_size=batch, nproc=1,
-                      token_dictionary_file=GF_DIR / "geneformer" / "token_dictionary_gc104M.pkl")
-    from _common import MODEL_DIR
-    ex.extract_embs(model_directory=str(MODEL_DIR.parent), input_data_file=str(dataset),
-                    output_directory=str(emb_dir), output_prefix="gene")
-    npys = sorted(emb_dir.glob("*.npy"))
-    if not npys:
-        log("  遺伝子埋め込みが得られませんでした（B は省略）")
-        return {}
-    arr = np.load(npys[0], allow_pickle=True).item()
-    name_id = pickle.load(open(GF_DIR / "geneformer" / "gene_name_id_dict_gc104M.pkl", "rb"))
-    id_name = {v: k for k, v in name_id.items()}
-    vecs, names = [], []
-    for ensg, v in arr.items():
-        vecs.append(np.asarray(v, dtype=np.float32).ravel())
-        names.append(id_name.get(ensg, str(ensg)))
-    m = np.vstack(vecs)
-    m = m / (np.linalg.norm(m, axis=1, keepdims=True) + 1e-9)
-    idx = {n: i for i, n in enumerate(names)}
+    from _common import GF_DIR, MODEL_DIR, TOKEN_DICT
+
+    tok_dict = pickle.load(open(TOKEN_DICT, "rb"))          # {Ensembl: token_id}
+    ensg_to_symbol = {v: k for k, v in ensembl_to_symbols(list(tok_dict.keys())).items()}
+    # token_id → 遺伝子記号（トークン ID は連番なので、辞書から逆引きする）
+    tok_id_to_symbol = {tid: sym for sym, tid in
+                        ((sym, tok_dict[ensg]) for ensg, sym in ensg_to_symbol.items())}
+    log(f"  辞書: {len(tok_dict):,} 遺伝子 / 記号に戻せた数: {len(tok_id_to_symbol):,}")
+    model = load_model("Pretrained", 0, str(MODEL_DIR)).to(DEVICE)
+    model.eval()
+    with torch.no_grad():
+        w = model.bert.embeddings.word_embeddings.weight.detach().float().cpu().numpy()
+    empty_cache()
+    w = w / (np.linalg.norm(w, axis=1, keepdims=True) + 1e-9)
+    log(f"  入力埋め込み行列: {w.shape}")
+
+    queries = symbols_to_ensembl(queries)
     res = {}
     for q in queries:
-        if q not in idx:
-            log(f"    {q}: 遺伝子埋め込みに存在しません")
+        tid = tok_dict.get(q)
+        if tid is None or tid >= w.shape[0]:
+            log(f"    {q}: 語彙に存在しません")
             continue
-        sim = m @ m[idx[q]]
-        order = np.argsort(-sim)[1:top_n + 1]
-        res[q] = [{"gene": names[i], "cosine": float(sim[i])} for i in order]
-        log(f"    {q}: {', '.join(x['gene'] for x in res[q][:6])} …")
-    empty_cache()
+        sim = w @ w[tid]
+        order = np.argsort(-sim)
+        rows = []
+        for i in order:
+            if i == tid:
+                continue
+            name = tok_id_to_symbol.get(int(i)) or f"token_{i}"
+            rows.append({"gene": name, "cosine": float(sim[i])})
+            if len(rows) >= top_n:
+                break
+        qsym = tok_id_to_symbol.get(tid, q)
+        res[qsym] = rows
+        log(f"    {qsym}: {', '.join(x['gene'] for x in rows[:6])} …")
     save_json(res, out / "markers_context.json")
     return res
 

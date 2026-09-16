@@ -24,9 +24,18 @@ import statsmodels.stats.multitest as smt
 from pathlib import Path
 from scipy.stats import ranksums
 from sklearn.mixture import GaussianMixture
-from tqdm.notebook import trange, tqdm
+from tqdm.auto import trange, tqdm
 
 from .tokenizer import TOKEN_DICTIONARY_FILE
+from scpeft_mps.device import DEVICE as _DEVICE, empty_cache as _empty_cache  # MPS/CUDA/CPU を自動で選ぶ
+
+
+def _to_device_tensor(x):
+    """datasets 4.x の Column/list でも動くようにテンソル化してデバイスへ移す。"""
+    if hasattr(x, "to"):
+        return x.to(_DEVICE)
+    return torch.as_tensor(np.asarray(list(x))).to(_DEVICE)
+
 
 GENE_NAME_ID_DICTIONARY_FILE = Path(__file__).parent / "gene_name_id_dict.pkl"
 

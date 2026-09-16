@@ -57,9 +57,13 @@ def main() -> int:
     import scanpy as sc
     df = pd.read_csv(csv)
     label = df[args.label_key].to_numpy() if args.label_key in df.columns else None
-    x = df.drop(columns=[c for c in ("cell_id", args.label_key) if c in df.columns]
-                ).to_numpy(dtype=np.float32)
-    log(f"  埋め込み: {x.shape}")
+    # 数値以外の列（cell_id, celltype, batch など）は埋め込みから除く。
+    # pandas 3 では Arrow 文字列が `object` にならないため is_numeric_dtype で判定する。
+    from pandas.api.types import is_numeric_dtype
+    drop = [c for c in df.columns
+            if (not is_numeric_dtype(df[c])) or c in ("cell_id", args.label_key)]
+    x = df.drop(columns=drop).to_numpy(dtype=np.float32)
+    log(f"  埋め込み: {x.shape}  除外した列: {drop}")
 
     adata = sc.AnnData(x)
     sc.pp.neighbors(adata, n_neighbors=args.n_neighbors, use_rep="X")

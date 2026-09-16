@@ -3,7 +3,6 @@ Geneformer embedding extractor.
 
 Usage:
   from geneformer import EmbExtractor
-from scpeft_mps.device import DEVICE as _DEVICE, empty_cache as _empty_cache  # MPS/CUDA/CPU を自動で選ぶ
   embex = EmbExtractor(model_type="CellClassifier",
                        num_classes=3,
                        emb_mode="cell",
@@ -40,10 +39,19 @@ import seaborn as sns
 import torch
 from collections import Counter
 from pathlib import Path
-from tqdm.notebook import trange
+from tqdm.auto import trange
 # from transformers import BertForMaskedLM, BertForTokenClassification, BertForSequenceClassification
 
 from .tokenizer import TOKEN_DICTIONARY_FILE
+from scpeft_mps.device import DEVICE as _DEVICE, empty_cache as _empty_cache  # MPS/CUDA/CPU を自動で選ぶ
+
+
+def _to_device_tensor(x):
+    """datasets 4.x の Column/list でも動くようにテンソル化してデバイスへ移す。"""
+    if hasattr(x, "to"):
+        return x.to(_DEVICE)
+    return torch.as_tensor(np.asarray(list(x))).to(_DEVICE)
+
 
 from .in_silico_perturber import load_and_filter, \
     downsample_and_sort, \
@@ -102,7 +110,7 @@ def get_embs(model,
 
         with torch.no_grad():
             outputs = model(
-                input_ids=input_data_minibatch.to(_DEVICE),
+                input_ids=_to_device_tensor(input_data_minibatch),
                 attention_mask=attention_mask.to(_DEVICE)
             )
 
