@@ -20,7 +20,7 @@ import argparse
 import sys
 from pathlib import Path
 
-from _common import (DEFAULT_BATCH, DEVICE, MODEL_DIR, TOKEN_DICT, banner, log, out_dir, save_json,
+from _common import (DEFAULT_BATCH, DEVICE, MODEL_DIR, NAME_ID_DICT, TOKEN_DICT, banner, log, out_dir, save_json,
                      symbols_to_ensembl, tokenize_h5ad, tracked)
 
 REPO = Path(__file__).resolve().parent.parent
@@ -41,6 +41,8 @@ def parse() -> argparse.Namespace:
     p.add_argument("--model-type", default="Pretrained", choices=["Pretrained", "CellClassifier"])
     p.add_argument("--num-classes", type=int, default=0)
     p.add_argument("--out", default=None)
+    p.add_argument("--stats-only", action="store_true",
+                   help="摂動は再実行せず、既存の raw 出力から集計だけやり直す")
     return p.parse_args()
 
 
@@ -109,35 +111,43 @@ def main() -> int:
     made = []
     for gene in genes:
         tag = gene
-        log(f"  摂動: {tag}")
-        isp = InSilicoPerturber(
-            perturb_type="delete",
-            genes_to_perturb=("all" if gene == "all" else [gene]),
-            combos=0,
-            anchor_gene=None,
-            model_type=args.model_type,
-            num_classes=args.num_classes,
-            emb_mode="cell",
-            cell_emb_style="mean_pool",
-            filter_data={"celltype": [args.celltype]} if args.celltype else None,
-            cell_states_to_model=states,
-            max_ncells=args.max_ncells,
-            emb_layer=-1,
-            forward_batch_size=args.batch,
-            nproc=1,
-            token_dictionary_file=TOKEN_DICT,   # 既定は別の辞書。gc104M を明示しないとトークンが一致しない
-        )
-        isp.perturb_data(model_directory=str(MODEL_DIR),
-                         input_data_file=str(ds),
-                         output_directory=str(out / tag),
-                         output_prefix=tag)
+        if not args.stats_only:
+            log(f"  摂動: {tag}")
+            isp = InSilicoPerturber(
+                perturb_type="delete",
+                genes_to_perturb=("all" if gene == "all" else [gene]),
+                combos=0,
+                anchor_gene=None,
+                model_type=args.model_type,
+                num_classes=args.num_classes,
+                emb_mode="cell",
+                cell_emb_style="mean_pool",
+                filter_data={"celltype": [args.celltype]} if args.celltype else None,
+                cell_states_to_model=states,
+                max_ncells=args.max_ncells,
+                emb_layer=-1,
+                forward_batch_size=args.batch,
+                nproc=1,
+                token_dictionary_file=TOKEN_DICT,   # 既定は別の辞書。gc104M を明示しないとトークンが一致しない
+            )
+            isp.perturb_data(model_directory=str(MODEL_DIR),
+                             input_data_file=str(ds),
+                             output_directory=str(out / tag),
+                             output_prefix=tag)
+        else:
+            log(f"  摂動: {tag}（--stats-only: 既存の raw 出力を集計）")
         made.append(str(out / tag))
 
-        stats = InSilicoPerturberStats(mode="goal_state_shift",
-                                       genes_perturbed=[gene],
+        # rank shift（genes_to_perturb="all"）は集計モードが違う。
+        # goal_state_shift は状態対の指定が前提で、そのまま渡すと int 反復で落ちる。
+        stats_mode = "aggregate_data" if gene == "all" else "goal_state_shift"
+        stats = InSilicoPerturberStats(mode=stats_mode,
+                                       genes_perturbed=("all" if gene == "all" else [gene]),
                                        combos=0,
                                        anchor_gene=None,
-                                       cell_states_to_model=states)
+                                       cell_states_to_model=states,
+                                       token_dictionary_file=TOKEN_DICT,
+                                       gene_name_id_dictionary_file=NAME_ID_DICT)
         stats.get_stats(input_data_directory=str(out / tag),
                         null_dist_data_directory=None,
                         output_directory=str(out / tag / "stats"),

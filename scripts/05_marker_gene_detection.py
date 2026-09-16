@@ -75,10 +75,9 @@ def context_markers(dataset: Path, queries: list[str], top_n: int, out: Path,
     from _common import GF_DIR, MODEL_DIR, TOKEN_DICT
 
     tok_dict = pickle.load(open(TOKEN_DICT, "rb"))          # {Ensembl: token_id}
-    ensg_to_symbol = {v: k for k, v in ensembl_to_symbols(list(tok_dict.keys())).items()}
-    # token_id → 遺伝子記号（トークン ID は連番なので、辞書から逆引きする）
-    tok_id_to_symbol = {tid: sym for sym, tid in
-                        ((sym, tok_dict[ensg]) for ensg, sym in ensg_to_symbol.items())}
+    ensg_to_symbol = ensembl_to_symbols(list(tok_dict.keys()))   # {Ensembl: 記号}
+    # token_id → 遺伝子記号（トークン ID は連番なので辞書から逆引きする）
+    tok_id_to_symbol = {tok_dict[e]: s for e, s in ensg_to_symbol.items() if e in tok_dict}
     log(f"  辞書: {len(tok_dict):,} 遺伝子 / 記号に戻せた数: {len(tok_id_to_symbol):,}")
     model = load_model("Pretrained", 0, str(MODEL_DIR)).to(DEVICE)
     model.eval()
