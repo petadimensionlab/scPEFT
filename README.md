@@ -1,5 +1,9 @@
 # scPEFT: Harnessing the Power of Single-Cell Large Language Models with Parameter-Efficient Fine-Tuning 
 
+> **このリポジトリで作業する前に**: 記述と検証の規範は [`docs/RULES_ja.md`](docs/RULES_ja.md) にあります。
+> 親のルールブックは Geneformer の `docs/isp/style-guide.md` で、Geneformer に固有でない規則は
+> このリポジトリにも適用します。MPS での実行手順は [`docs/MPS.md`](docs/MPS.md) にあります。
+
 This is the official repository for **Harnessing the Power of Single Cell Large Language Models with Parameter Efficient
 Fine-Tuning using scPEFT**. To reproduce the results from the paper, please visit [scPEFT_reproduction](https://github.com/coffee19850519/scPEFT_reproduction).
 
