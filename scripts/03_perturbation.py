@@ -43,6 +43,8 @@ def parse() -> argparse.Namespace:
     p.add_argument("--out", default=None)
     p.add_argument("--stats-only", action="store_true",
                    help="摂動は再実行せず、既存の raw 出力から集計だけやり直す")
+    p.add_argument("--per-gene", action="store_true",
+                   help="複数遺伝子をまとめず 1 遺伝子ずつ摂動する（既定は同時摂動）")
     return p.parse_args()
 
 
@@ -81,10 +83,8 @@ def main() -> int:
     if args.start and args.goal:
         states = {args.state_key: ([args.start], [args.goal], [])}
 
-    # 複数遺伝子をまとめて渡すと「全遺伝子を共発現する細胞」が必要になり、空集合で止まる。
-    # リポジトリのチュートリアルと同じく **1 遺伝子ずつ**実行する。
-    # 遺伝子が細胞に 1 つも無いと ISP は「共発現する細胞が無い」で止まる。
-    # 実行前にトークン保有細胞を数え、0 の遺伝子は理由を添えて除外する。
+    # 事前確認: 遺伝子ごとの保有細胞数と、全遺伝子を共発現する細胞数を数える。
+    # ISP は「指定した全遺伝子を持つ細胞」だけを摂動するので、共発現が 0 だと止まる。
     import datasets as _ds
     import pickle as _pk
     from _common import TOKEN_DICT as _TD
@@ -95,7 +95,7 @@ def main() -> int:
     else:
         toks = _ds.load_from_disk(str(ds))
         sub = toks.filter(lambda ex: ex.get("celltype") == args.celltype) if args.celltype else toks
-        usable = []
+        usable, hits = [], []
         for gene in genes:
             tid = allowed.get(gene)
             n_hit = sum(1 for row in sub["input_ids"] if tid in row)
@@ -104,18 +104,35 @@ def main() -> int:
                 log(f"  !! {gene} は対象細胞に存在しないため除外します（削除しても何も起きない）")
                 continue
             usable.append(gene)
+            hits.append(tid)
         if not usable:
             raise SystemExit("削除できる遺伝子がありません（発現する遺伝子を指定してください）")
+        if len(usable) > 1:
+            n_all = sum(1 for row in sub["input_ids"] if all(t in row for t in hits))
+            log(f"  共発現: 指定した {len(usable)} 遺伝子をすべて持つ細胞 → {n_all} / {len(sub)}"
+                f"（{n_all / max(len(sub), 1):.1%}）")
+            if n_all == 0:
+                raise SystemExit(
+                    "指定した遺伝子をすべて持つ細胞が無いため、同時摂動できません。"
+                    " --per-gene を付けると 1 遺伝子ずつ摂動できます。")
         genes = usable
 
+    # 実行単位。Geneformer の list 指定は「まとめて同時に摂動」の意味なので、
+    # 既定は 1 回の ISP で全遺伝子を渡す（複数遺伝子を一度に扱える）。
+    # --per-gene を付けたときだけ 1 遺伝子ずつに分ける。
+    units = [[g] for g in genes] if args.per_gene else [genes]
+    log(f"  実行単位: {len(units)} 回（{'1 遺伝子ずつ' if args.per_gene else 'まとめて同時摂動'}）")
+
     made = []
-    for gene in genes:
-        tag = gene
+    for unit in units:
+        tag = "+".join("all" if g == "all" else g for g in unit)
+        tagdir = out / tag
+        tagdir.mkdir(parents=True, exist_ok=True)   # ISP は作成しない
         if not args.stats_only:
-            log(f"  摂動: {tag}")
+            log(f"  摂動: {tag}（同時に {len(unit)} 遺伝子）")
             isp = InSilicoPerturber(
                 perturb_type="delete",
-                genes_to_perturb=("all" if gene == "all" else [gene]),
+                genes_to_perturb=("all" if unit[0] == "all" else list(unit)),
                 combos=0,
                 anchor_gene=None,
                 model_type=args.model_type,
@@ -132,25 +149,35 @@ def main() -> int:
             )
             isp.perturb_data(model_directory=str(MODEL_DIR),
                              input_data_file=str(ds),
-                             output_directory=str(out / tag),
+                             output_directory=str(tagdir) + "/",
                              output_prefix=tag)
         else:
             log(f"  摂動: {tag}（--stats-only: 既存の raw 出力を集計）")
-        made.append(str(out / tag))
+        made.append(str(tagdir))
 
-        # rank shift（genes_to_perturb="all"）は集計モードが違う。
-        # goal_state_shift は状態対の指定が前提で、そのまま渡すと int 反復で落ちる。
-        stats_mode = "aggregate_data" if gene == "all" else "goal_state_shift"
+        # 集計モードは実行内容で決まる。
+        #   goal_state_shift: 状態対があるときだけ（無いと None.keys() で落ちる）
+        #   aggregate_data  : 遺伝子を明示した摂動（1 細胞に 1 摂動）をまとめる
+        #   注意: aggregate_data は genes_perturbed="all" を拒否する
+        if states is not None:
+            stats_mode = "goal_state_shift"
+        elif unit[0] != "all":
+            stats_mode = "aggregate_data"
+        else:
+            raise SystemExit(
+                "rank shift（--genes all）の集計には状態対が必要です。"
+                " --start/--goal を指定してください。")
+        (tagdir / "stats").mkdir(parents=True, exist_ok=True)   # 集計も作成しない
         stats = InSilicoPerturberStats(mode=stats_mode,
-                                       genes_perturbed=("all" if gene == "all" else [gene]),
+                                       genes_perturbed=("all" if unit[0] == "all" else list(unit)),
                                        combos=0,
                                        anchor_gene=None,
                                        cell_states_to_model=states,
                                        token_dictionary_file=TOKEN_DICT,
                                        gene_name_id_dictionary_file=NAME_ID_DICT)
-        stats.get_stats(input_data_directory=str(out / tag),
+        stats.get_stats(input_data_directory=str(tagdir),
                         null_dist_data_directory=None,
-                        output_directory=str(out / tag / "stats"),
+                        output_directory=str(tagdir / "stats"),
                         output_prefix="shift")
 
     logs = sorted((out).glob("*"))

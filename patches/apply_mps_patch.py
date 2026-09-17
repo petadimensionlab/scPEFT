@@ -78,6 +78,57 @@ RULES: list[tuple[re.Pattern[str], str]] = [
     # 7) datasets 4.x の Column は `*` で繰り返せない（rank shift の系列生成）。
     (re.compile(r'"input_ids": example_cell\["input_ids"\] \* length,'),
      '"input_ids": list(example_cell["input_ids"]) * length,'),
+    # 8) 上流の欠陥: ミニバッチごとにパディング長が違うコサイン類似をそのまま連結する。
+    #    トークン方向を最短に揃えてから連結する（位置は発現量順で対応が取れる）。
+    (re.compile(r'cos_sims_stack = torch\.cat\(cos_sims\)'),
+     'cos_sims_stack = _cat_align(cos_sims)'),
+]
+
+# 関数まるごとの差し替え（部分置換では直しきれない上流欠陥）。
+# `def <name>(` から次のトップレベル定義（`def ` か `#` で始まる行）までの区間を置き換える。
+FUNC_MARK = "# scpeft-mps: 次元に依存しない実装"
+FUNC_REWRITES: list[tuple[str, str]] = [
+    ("make_comparison_batch", '''def make_comparison_batch(original_emb_batch, indices_to_perturb, perturb_group):
+    # scpeft-mps: 次元に依存しない実装
+    all_embs_list = []
+
+    # 入力を「細胞ごとの 2 次元埋め込み（トークン × 隠れ次元）」の並びに正規化する。
+    # 上流はここで 2 次元を前提に切片を作るが、実際には (B, L, H) の 3 次元が渡る。
+    # そのまま切ると細胞の軸を切り、長さの違う細胞同士を連結して落ちる。
+    if isinstance(original_emb_batch, torch.Tensor):
+        if original_emb_batch.dim() >= 3:
+            cells = [original_emb_batch[i] for i in range(original_emb_batch.size(0))]
+        else:
+            cells = [original_emb_batch]
+    else:
+        cells = list(original_emb_batch)
+
+    # 群摂動（複数遺伝子をまとめて 1 細胞ずつ）か、単一細胞に複数の摂動か。
+    if perturb_group:
+        src = cells[: len(indices_to_perturb)]
+    else:
+        src = [cells[0]] * len(indices_to_perturb)
+
+    for cell_emb, indices in zip(src, indices_to_perturb):
+        if indices == [-100]:
+            all_embs_list.append(cell_emb)
+            continue
+        if any(isinstance(el, list) for el in indices):
+            indices = flatten_list(indices)
+        pieces = []
+        start = 0
+        for pos in sorted(indices):
+            pieces.append(cell_emb[start:pos])
+            start = pos + 1
+        pieces.append(cell_emb[start:])
+        all_embs_list.append(torch.cat(pieces, dim=0))
+
+    len_set = set([emb.size()[0] for emb in all_embs_list])
+    if len_set and len(len_set) > 1:
+        max_len = max(len_set)
+        all_embs_list = [pad_2d_tensor(emb, None, max_len, 0) for emb in all_embs_list]
+    return torch.stack(all_embs_list)
+'''),
 ]
 
 # import 行の直後に置くヘルパー（datasets 4.x の Column 対応）
@@ -106,6 +157,24 @@ def _to_device_tensor(x):
     if hasattr(x, "to"):
         return x.to(_DEVICE)
     return torch.as_tensor(np.asarray(list(x))).to(_DEVICE)
+
+
+def _cat_align(tensors, dim=1):
+    """トークン方向の長さが違うテンソル群を、最短に揃えてから連結する。
+
+    ミニバッチごとにパディング長が異なるため、そのまま連結すると長さが合わない。
+    位置は発現量順の並びなので、短い側を基準に揃えるのが比較として素直
+    （長い細胞にしか無い下位の位置は、短い側に対応物が無い）。
+    """
+    if not tensors:
+        return tensors
+    n = min(t.size(dim) for t in tensors)
+    out = []
+    for t in tensors:
+        sl = [slice(None)] * t.dim()
+        sl[dim] = slice(0, n)
+        out.append(t[tuple(sl)])
+    return torch.cat(out, dim=0)
 
 
 def _align_token_len(x1, x2, dim=1):
@@ -175,7 +244,25 @@ def apply_import(src: str) -> str:
 
 
 def count_hits(src: str) -> int:
-    return sum(len(p.findall(src)) for p, _ in RULES)
+    n = sum(len(p.findall(src)) for p, _ in RULES)
+    n += sum(1 for name, _ in FUNC_REWRITES if f"def {name}(" in src and FUNC_MARK not in src)
+    return n
+
+
+def apply_func_rewrite(src: str, name: str, code: str) -> str:
+    """`def <name>(` から次のトップレベル定義の直前までを差し替える。"""
+    if FUNC_MARK in src:
+        return src
+    lines = src.split("\n")
+    start = next((i for i, ln in enumerate(lines) if ln.startswith(f"def {name}(")), None)
+    if start is None:
+        return src
+    end = len(lines)
+    for j in range(start + 1, len(lines)):
+        if lines[j].startswith("def ") or lines[j].startswith("#"):
+            end = j
+            break
+    return "\n".join(lines[:start] + code.rstrip("\n").split("\n") + [""] + lines[end:])
 
 
 def main() -> None:
@@ -208,6 +295,8 @@ def main() -> None:
         new = src
         for pat, rep in RULES:
             new = pat.sub(rep, new)
+        for name, code in FUNC_REWRITES:
+            new = apply_func_rewrite(new, name, code)
         new = apply_import(new)
         if new != src:
             f.write_text(new)

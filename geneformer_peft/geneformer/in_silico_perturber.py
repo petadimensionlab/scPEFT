@@ -71,6 +71,24 @@ def _to_device_tensor(x):
     return torch.as_tensor(np.asarray(list(x))).to(_DEVICE)
 
 
+def _cat_align(tensors, dim=1):
+    """トークン方向の長さが違うテンソル群を、最短に揃えてから連結する。
+
+    ミニバッチごとにパディング長が異なるため、そのまま連結すると長さが合わない。
+    位置は発現量順の並びなので、短い側を基準に揃えるのが比較として素直
+    （長い細胞にしか無い下位の位置は、短い側に対応物が無い）。
+    """
+    if not tensors:
+        return tensors
+    n = min(t.size(dim) for t in tensors)
+    out = []
+    for t in tensors:
+        sl = [slice(None)] * t.dim()
+        sl[dim] = slice(0, n)
+        out.append(t[tuple(sl)])
+    return torch.cat(out, dim=0)
+
+
 def _align_token_len(x1, x2, dim=1):
     """トークン方向の長さがずれた 2 つのテンソルを、短い方に合わせて切り詰める。
 
@@ -284,36 +302,45 @@ def make_perturbation_batch(example_cell,
 # so that only non-perturbed gene embeddings are compared to each other
 # in original or perturbed context
 def make_comparison_batch(original_emb_batch, indices_to_perturb, perturb_group):
+    # scpeft-mps: 次元に依存しない実装
     all_embs_list = []
 
-    # if making comparison batch for multiple perturbations in single cell
-    if perturb_group == False:
-        original_emb_list = [original_emb_batch] * len(indices_to_perturb)
-    # if making comparison batch for single perturbation in multiple cells
-    elif perturb_group == True:
-        original_emb_list = original_emb_batch
+    # 入力を「細胞ごとの 2 次元埋め込み（トークン × 隠れ次元）」の並びに正規化する。
+    # 上流はここで 2 次元を前提に切片を作るが、実際には (B, L, H) の 3 次元が渡る。
+    # そのまま切ると細胞の軸を切り、長さの違う細胞同士を連結して落ちる。
+    if isinstance(original_emb_batch, torch.Tensor):
+        if original_emb_batch.dim() >= 3:
+            cells = [original_emb_batch[i] for i in range(original_emb_batch.size(0))]
+        else:
+            cells = [original_emb_batch]
+    else:
+        cells = list(original_emb_batch)
 
-    for i in range(len(original_emb_list)):
-        original_emb = original_emb_list[i]
-        indices = indices_to_perturb[i]
+    # 群摂動（複数遺伝子をまとめて 1 細胞ずつ）か、単一細胞に複数の摂動か。
+    if perturb_group:
+        src = cells[: len(indices_to_perturb)]
+    else:
+        src = [cells[0]] * len(indices_to_perturb)
+
+    for cell_emb, indices in zip(src, indices_to_perturb):
         if indices == [-100]:
-            all_embs_list += [original_emb[:]]
+            all_embs_list.append(cell_emb)
             continue
-        emb_list = []
-        start = 0
         if any(isinstance(el, list) for el in indices):
             indices = flatten_list(indices)
-        for i in sorted(indices):
-            emb_list += [original_emb[start:i]]
-            start = i + 1
-        emb_list += [original_emb[start:]]
-        all_embs_list += [torch.cat(emb_list)]
+        pieces = []
+        start = 0
+        for pos in sorted(indices):
+            pieces.append(cell_emb[start:pos])
+            start = pos + 1
+        pieces.append(cell_emb[start:])
+        all_embs_list.append(torch.cat(pieces, dim=0))
+
     len_set = set([emb.size()[0] for emb in all_embs_list])
-    if len(len_set) > 1:
+    if len_set and len(len_set) > 1:
         max_len = max(len_set)
         all_embs_list = [pad_2d_tensor(emb, None, max_len, 0) for emb in all_embs_list]
     return torch.stack(all_embs_list)
-
 
 # average embedding position of goal cell states
 def get_cell_state_avg_embs(model,
@@ -508,7 +535,7 @@ def quant_cos_sims(model,
             del minibatch_comparison
         _empty_cache()
     if cell_states_to_model is None:
-        cos_sims_stack = torch.cat(cos_sims)
+        cos_sims_stack = _cat_align(cos_sims)
         return cos_sims_stack
     else:
         for state in possible_states:
