@@ -49,11 +49,11 @@ RULES: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r'\boriginal_input_data_minibatch\.to\(_DEVICE\)'),
      "_to_device_tensor(original_input_data_minibatch)"),
     (re.compile(r'\binput_data\.to\(_DEVICE\)'), "_to_device_tensor(input_data)"),
-    # 3) 上流の欠陥: 比較バッチと摂動バッチの系列長がトークン 1 個ずれる場合がある
-    #    （削除で短くなった摂動側と、パディングで揃えられた比較側）。コサイン類似の前に
-    #    共通の短い方へ切り詰める。位置は発現量順の並びなので余った末尾に対応物はない。
+    # 3) 上流の欠陥: 比較バッチと摂動バッチのトークン長がずれたままコサイン類似を取る。
+    #    黙って切り詰めると値が変わり、しかも同梱する細胞次第で結果が変わるため、
+    #    長さが合わない場合は黙って通さず、はっきり落とす。
     (re.compile(r'cos_sims \+= \[cos\(minibatch_emb, minibatch_comparison\)\.to\("cpu"\)\]'),
-     'cos_sims += [cos(*_align_token_len(minibatch_emb, minibatch_comparison)).to("cpu")]'),
+     'cos_sims += [cos(*_check_same_len(minibatch_emb, minibatch_comparison)).to("cpu")]'),
     # 4) 上流の欠陥: `torch.squeeze` が 1 細胞ミニバッチのバッチ次元を潰し、
     #    トークン数を細胞数として数えてインデックスが範囲外になる。バッチ次元は残す。
     #    対象はミニバッチを扱う 2 箇所だけ（forward_pass_single_cell は 1 細胞専用で
@@ -63,8 +63,7 @@ RULES: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r'original_minibatch_emb = torch\.squeeze\(original_outputs\.hidden_states\[layer_to_quant\]\)'),
      'original_minibatch_emb = _squeeze_keep_batch(original_outputs.hidden_states[layer_to_quant])'),
     # 5) 上流の欠陥: 群摂動の比較バッチに **全細胞分** のインデックスを渡している。
-    #    ループはミニバッチの行を数えるので、別の細胞の位置で切って長さが合わなくなる
-    #    （`Sizes of tensors must match ... Expected size 3851 but got size 3161`）。
+    #    ループはミニバッチの行を数えるので、別の細胞の位置で切って長さが合わなくなる。
     #    ミニバッチに対応する区間だけを渡す。
     (re.compile(r'minibatch_comparison = make_comparison_batch\(original_minibatch_emb,\n'
                 r'(\s+)indices_to_perturb,\n'),
@@ -78,10 +77,82 @@ RULES: list[tuple[re.Pattern[str], str]] = [
     # 7) datasets 4.x の Column は `*` で繰り返せない（rank shift の系列生成）。
     (re.compile(r'"input_ids": example_cell\["input_ids"\] \* length,'),
      '"input_ids": list(example_cell["input_ids"]) * length,'),
-    # 8) 上流の欠陥: ミニバッチごとにパディング長が違うコサイン類似をそのまま連結する。
-    #    トークン方向を最短に揃えてから連結する（位置は発現量順で対応が取れる）。
-    (re.compile(r'cos_sims_stack = torch\.cat\(cos_sims\)'),
-     'cos_sims_stack = _cat_align(cos_sims)'),
+    # 8) 上流の欠陥: ミニバッチごとにパディング幅が異なるため torch.cat が成立しない。
+    #    幅はパディング（実データではない）なので、全ミニバッチを同じ幅に揃える。
+    (re.compile(r'        # determine if need to pad or truncate batch\n'
+                r'        minibatch_length_set = set\(perturbation_minibatch\["length"\]\)\n'
+                r'        if \(len\(minibatch_length_set\) > 1\) or '
+                r'\(max\(minibatch_length_set\) > model_input_size\):\n'
+                r'            needs_pad_or_trunc = True\n'
+                r'        else:\n'
+                r'            needs_pad_or_trunc = False\n'
+                r'\n'
+                r'        if needs_pad_or_trunc == True:\n'
+                r'            max_len = min\(max\(minibatch_length_set\), model_input_size\)\n'
+                r'\n'
+                r'            def pad_or_trunc_example\(example\):\n'
+                r'                example\["input_ids"\] = pad_or_truncate_encoding\('
+                r'example\["input_ids"\],\n'
+                r'                                                                pad_token_id,\n'
+                r'                                                                max_len\)\n'
+                r'                return example\n'
+                r'\n'
+                r'            perturbation_minibatch = perturbation_minibatch\.map\('
+                r'pad_or_trunc_example, num_proc=nproc\)\n'),
+     '        # 幅は全ミニバッチで統一する。パディングは下流で各細胞の元の長さにより\n'
+     '        # 落とされるので、幅そのものは結果に影響しない。揃えないと最後の\n'
+     '        # torch.cat(cos_sims) が成立しない。\n'
+     '        max_len = global_max_len\n'
+     '\n'
+     '        def pad_or_trunc_example(example):\n'
+     '            example["input_ids"] = pad_or_truncate_encoding(example["input_ids"],\n'
+     '                                                            pad_token_id,\n'
+     '                                                            max_len)\n'
+     '            return example\n'
+     '\n'
+     '        perturbation_minibatch = perturbation_minibatch.map(pad_or_trunc_example, num_proc=nproc)\n'),
+    # 9) 8) で使う共通幅をループの前に決める（摂動バッチ全体の最大長 / モデル上限）。
+    (re.compile(r'    # measure length of each element in perturbation_batch\n'
+                r'    perturbation_batch = perturbation_batch\.map\(\n'
+                r'        measure_length, num_proc=nproc\n'
+                r'    \)\n'),
+     '    # measure length of each element in perturbation_batch\n'
+     '    perturbation_batch = perturbation_batch.map(\n'
+     '        measure_length, num_proc=nproc\n'
+     '    )\n'
+     '    # 全ミニバッチで共通のパディング幅。下流は各細胞の元の長さでパディングを\n'
+     '    # 落とすので、幅を揃えても細胞ごとの値は変わらない。\n'
+     '    global_max_len = min(int(max(perturbation_batch["length"])),\n'
+     '                         model_input_size - len(tokens_to_perturb))\n'),
+    # 10) 摂動側を共通幅に揃えたので、比較側も同じ幅になるようパディングする。
+    #     比較側は「削除されるトークン数だけ長く」しておき、切り出した後に一致させる。
+    (re.compile(r'            if perturb_type == "overexpress":\n'
+                r'                new_max_len = model_input_size - len\(tokens_to_perturb\)\n'
+                r'            else:\n'
+                r'                new_max_len = model_input_size\n'
+                r'            if \(len\(original_minibatch_length_set\) > 1\) or '
+                r'\(max\(original_minibatch_length_set\) > new_max_len\):\n'
+                r'                original_max_len = min\(max\(original_minibatch_length_set\), new_max_len\)\n'
+                r'\n'
+                r'                def pad_or_trunc_example\(example\):\n'
+                r'                    example\["input_ids"\] = pad_or_truncate_encoding\('
+                r'example\["input_ids"\], pad_token_id,\n'
+                r'                                                                    original_max_len\)\n'
+                r'                    return example\n'
+                r'\n'
+                r'                original_minibatch = original_minibatch\.map\('
+                r'pad_or_trunc_example, num_proc=nproc\)\n'),
+     '            # 比較側は削除分だけ長くパディングしておく。切り出した後で\n'
+     '            # 摂動側（global_max_len）と幅が一致する。\n'
+     '            original_max_len = global_max_len + len(tokens_to_perturb)\n'
+     '\n'
+     '            def pad_or_trunc_example(example):\n'
+     '                example["input_ids"] = pad_or_truncate_encoding(example["input_ids"],\n'
+     '                                                                pad_token_id,\n'
+     '                                                                original_max_len)\n'
+     '                return example\n'
+     '\n'
+     '            original_minibatch = original_minibatch.map(pad_or_trunc_example, num_proc=nproc)\n'),
 ]
 
 # 関数まるごとの差し替え（部分置換では直しきれない上流欠陥）。
@@ -159,38 +230,20 @@ def _to_device_tensor(x):
     return torch.as_tensor(np.asarray(list(x))).to(_DEVICE)
 
 
-def _cat_align(tensors, dim=1):
-    """トークン方向の長さが違うテンソル群を、最短に揃えてから連結する。
+def _check_same_len(x1, x2, dim=1):
+    """トークン方向の長さが一致していることを確認する（違えば黙って通さず落とす）。
 
-    ミニバッチごとにパディング長が異なるため、そのまま連結すると長さが合わない。
-    位置は発現量順の並びなので、短い側を基準に揃えるのが比較として素直
-    （長い細胞にしか無い下位の位置は、短い側に対応物が無い）。
+    長さがずれたまま片方を切り詰めると値が変わり、しかも「同梱する他の細胞」に
+    よって切り詰め量が変わるため、同じ細胞でも実行ごとに結果が動く。比較の前提が
+    崩れているときは、黙って辻褄を合わせずに停止させる。
     """
-    if not tensors:
-        return tensors
-    n = min(t.size(dim) for t in tensors)
-    out = []
-    for t in tensors:
-        sl = [slice(None)] * t.dim()
-        sl[dim] = slice(0, n)
-        out.append(t[tuple(sl)])
-    return torch.cat(out, dim=0)
-
-
-def _align_token_len(x1, x2, dim=1):
-    """トークン方向の長さがずれた 2 つのテンソルを、短い方に合わせて切り詰める。
-
-    上流の比較バッチ生成は、遺伝子を 1 つ削った摂動側と、パディングで長さを
-    揃えた比較側とで系列長がトークン 1 個ずれることがある。位置は発現量順の
-    並びなので、はみ出した末尾には対応する位置が無く、切り詰めが妥当。
-    """
-    n = min(x1.size(dim), x2.size(dim))
-    sl = [slice(None)] * x1.dim()
-    sl[dim] = slice(0, n)
-    x1 = x1[tuple(sl)]
-    sl = [slice(None)] * x2.dim()
-    sl[dim] = slice(0, n)
-    return x1, x2[tuple(sl)]
+    n1, n2 = x1.size(dim), x2.size(dim)
+    if n1 != n2:
+        raise RuntimeError(
+            f"比較のトークン長が一致しません（{n1} と {n2}）。"
+            "パディング幅の不整合が疑われるため、黙って切り詰めずに停止しました。"
+        )
+    return x1, x2
 '''
 
 

@@ -55,38 +55,20 @@ def _to_device_tensor(x):
     return torch.as_tensor(np.asarray(list(x))).to(_DEVICE)
 
 
-def _cat_align(tensors, dim=1):
-    """トークン方向の長さが違うテンソル群を、最短に揃えてから連結する。
+def _check_same_len(x1, x2, dim=1):
+    """トークン方向の長さが一致していることを確認する（違えば黙って通さず落とす）。
 
-    ミニバッチごとにパディング長が異なるため、そのまま連結すると長さが合わない。
-    位置は発現量順の並びなので、短い側を基準に揃えるのが比較として素直
-    （長い細胞にしか無い下位の位置は、短い側に対応物が無い）。
+    長さがずれたまま片方を切り詰めると値が変わり、しかも「同梱する他の細胞」に
+    よって切り詰め量が変わるため、同じ細胞でも実行ごとに結果が動く。比較の前提が
+    崩れているときは、黙って辻褄を合わせずに停止させる。
     """
-    if not tensors:
-        return tensors
-    n = min(t.size(dim) for t in tensors)
-    out = []
-    for t in tensors:
-        sl = [slice(None)] * t.dim()
-        sl[dim] = slice(0, n)
-        out.append(t[tuple(sl)])
-    return torch.cat(out, dim=0)
-
-
-def _align_token_len(x1, x2, dim=1):
-    """トークン方向の長さがずれた 2 つのテンソルを、短い方に合わせて切り詰める。
-
-    上流の比較バッチ生成は、遺伝子を 1 つ削った摂動側と、パディングで長さを
-    揃えた比較側とで系列長がトークン 1 個ずれることがある。位置は発現量順の
-    並びなので、はみ出した末尾には対応する位置が無く、切り詰めが妥当。
-    """
-    n = min(x1.size(dim), x2.size(dim))
-    sl = [slice(None)] * x1.dim()
-    sl[dim] = slice(0, n)
-    x1 = x1[tuple(sl)]
-    sl = [slice(None)] * x2.dim()
-    sl[dim] = slice(0, n)
-    return x1, x2[tuple(sl)]
+    n1, n2 = x1.size(dim), x2.size(dim)
+    if n1 != n2:
+        raise RuntimeError(
+            f"比較のトークン長が一致しません（{n1} と {n2}）。"
+            "パディング幅の不整合が疑われるため、黙って切り詰めずに停止しました。"
+        )
+    return x1, x2
 
 
 GENE_NAME_ID_DICTIONARY_FILE = Path(__file__).parent / "gene_name_id_dict.pkl"

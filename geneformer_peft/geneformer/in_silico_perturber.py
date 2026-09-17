@@ -71,38 +71,20 @@ def _to_device_tensor(x):
     return torch.as_tensor(np.asarray(list(x))).to(_DEVICE)
 
 
-def _cat_align(tensors, dim=1):
-    """トークン方向の長さが違うテンソル群を、最短に揃えてから連結する。
+def _check_same_len(x1, x2, dim=1):
+    """トークン方向の長さが一致していることを確認する（違えば黙って通さず落とす）。
 
-    ミニバッチごとにパディング長が異なるため、そのまま連結すると長さが合わない。
-    位置は発現量順の並びなので、短い側を基準に揃えるのが比較として素直
-    （長い細胞にしか無い下位の位置は、短い側に対応物が無い）。
+    長さがずれたまま片方を切り詰めると値が変わり、しかも「同梱する他の細胞」に
+    よって切り詰め量が変わるため、同じ細胞でも実行ごとに結果が動く。比較の前提が
+    崩れているときは、黙って辻褄を合わせずに停止させる。
     """
-    if not tensors:
-        return tensors
-    n = min(t.size(dim) for t in tensors)
-    out = []
-    for t in tensors:
-        sl = [slice(None)] * t.dim()
-        sl[dim] = slice(0, n)
-        out.append(t[tuple(sl)])
-    return torch.cat(out, dim=0)
-
-
-def _align_token_len(x1, x2, dim=1):
-    """トークン方向の長さがずれた 2 つのテンソルを、短い方に合わせて切り詰める。
-
-    上流の比較バッチ生成は、遺伝子を 1 つ削った摂動側と、パディングで長さを
-    揃えた比較側とで系列長がトークン 1 個ずれることがある。位置は発現量順の
-    並びなので、はみ出した末尾には対応する位置が無く、切り詰めが妥当。
-    """
-    n = min(x1.size(dim), x2.size(dim))
-    sl = [slice(None)] * x1.dim()
-    sl[dim] = slice(0, n)
-    x1 = x1[tuple(sl)]
-    sl = [slice(None)] * x2.dim()
-    sl[dim] = slice(0, n)
-    return x1, x2[tuple(sl)]
+    n1, n2 = x1.size(dim), x2.size(dim)
+    if n1 != n2:
+        raise RuntimeError(
+            f"比較のトークン長が一致しません（{n1} と {n2}）。"
+            "パディング幅の不整合が疑われるため、黙って切り詰めずに停止しました。"
+        )
+    return x1, x2
 
 
 logger = logging.getLogger(__name__)
@@ -425,29 +407,28 @@ def quant_cos_sims(model,
     perturbation_batch = perturbation_batch.map(
         measure_length, num_proc=nproc
     )
+    # 全ミニバッチで共通のパディング幅。下流は各細胞の元の長さでパディングを
+    # 落とすので、幅を揃えても細胞ごとの値は変わらない。
+    global_max_len = min(int(max(perturbation_batch["length"])),
+                         model_input_size - len(tokens_to_perturb))
 
     for i in range(0, total_batch_length, forward_batch_size):
         max_range = min(i + forward_batch_size, total_batch_length)
 
         perturbation_minibatch = perturbation_batch.select([i for i in range(i, max_range)])
 
-        # determine if need to pad or truncate batch
-        minibatch_length_set = set(perturbation_minibatch["length"])
-        if (len(minibatch_length_set) > 1) or (max(minibatch_length_set) > model_input_size):
-            needs_pad_or_trunc = True
-        else:
-            needs_pad_or_trunc = False
+        # 幅は全ミニバッチで統一する。パディングは下流で各細胞の元の長さにより
+        # 落とされるので、幅そのものは結果に影響しない。揃えないと最後の
+        # torch.cat(cos_sims) が成立しない。
+        max_len = global_max_len
 
-        if needs_pad_or_trunc == True:
-            max_len = min(max(minibatch_length_set), model_input_size)
+        def pad_or_trunc_example(example):
+            example["input_ids"] = pad_or_truncate_encoding(example["input_ids"],
+                                                            pad_token_id,
+                                                            max_len)
+            return example
 
-            def pad_or_trunc_example(example):
-                example["input_ids"] = pad_or_truncate_encoding(example["input_ids"],
-                                                                pad_token_id,
-                                                                max_len)
-                return example
-
-            perturbation_minibatch = perturbation_minibatch.map(pad_or_trunc_example, num_proc=nproc)
+        perturbation_minibatch = perturbation_minibatch.map(pad_or_trunc_example, num_proc=nproc)
         perturbation_minibatch.set_format(type="torch")
 
         input_data_minibatch = perturbation_minibatch["input_ids"]
@@ -480,19 +461,17 @@ def quant_cos_sims(model,
             # since max input size of perturb batch will be reduced by # tokens to overexpress 
             original_minibatch = original_emb.select([i for i in range(i, max_range)])
             original_minibatch_length_set = set(original_minibatch["length"])
-            if perturb_type == "overexpress":
-                new_max_len = model_input_size - len(tokens_to_perturb)
-            else:
-                new_max_len = model_input_size
-            if (len(original_minibatch_length_set) > 1) or (max(original_minibatch_length_set) > new_max_len):
-                original_max_len = min(max(original_minibatch_length_set), new_max_len)
+            # 比較側は削除分だけ長くパディングしておく。切り出した後で
+            # 摂動側（global_max_len）と幅が一致する。
+            original_max_len = global_max_len + len(tokens_to_perturb)
 
-                def pad_or_trunc_example(example):
-                    example["input_ids"] = pad_or_truncate_encoding(example["input_ids"], pad_token_id,
-                                                                    original_max_len)
-                    return example
+            def pad_or_trunc_example(example):
+                example["input_ids"] = pad_or_truncate_encoding(example["input_ids"],
+                                                                pad_token_id,
+                                                                original_max_len)
+                return example
 
-                original_minibatch = original_minibatch.map(pad_or_trunc_example, num_proc=nproc)
+            original_minibatch = original_minibatch.map(pad_or_trunc_example, num_proc=nproc)
             original_minibatch.set_format(type="torch")
             original_input_data_minibatch = original_minibatch["input_ids"]
             # extract embeddings for original minibatch
@@ -516,7 +495,7 @@ def quant_cos_sims(model,
                 minibatch_comparison = make_comparison_batch(original_minibatch_emb,
                                                              indices_to_perturb[i:max_range],
                                                              perturb_group)
-            cos_sims += [cos(*_align_token_len(minibatch_emb, minibatch_comparison)).to("cpu")]
+            cos_sims += [cos(*_check_same_len(minibatch_emb, minibatch_comparison)).to("cpu")]
         elif cell_states_to_model is not None:
             for state in possible_states:
                 if perturb_group == False:
@@ -535,7 +514,7 @@ def quant_cos_sims(model,
             del minibatch_comparison
         _empty_cache()
     if cell_states_to_model is None:
-        cos_sims_stack = _cat_align(cos_sims)
+        cos_sims_stack = torch.cat(cos_sims)
         return cos_sims_stack
     else:
         for state in possible_states:
